@@ -1,0 +1,808 @@
+#include <Arduino.h>
+#include "DW1000.h"
+
+
+/*
+ * ============================================================
+ *        ESP32-WROOM + DW1000 THREE NODE SYSTEM
+ * ============================================================
+ *
+ * Nodes:
+ *
+ *              NODE01
+ *              /    \
+ *             /      \
+ *         NODE02 ---- NODE03
+ *
+ *
+ * Each node:
+ *
+ *  1. Transmits UWB packets.
+ *  2. Receives UWB packets from the other two nodes.
+ *  3. Extracts:
+ *
+ *       Time
+ *       TOA
+ *       RSSI
+ *       FP_POWER
+ *
+ *  4. Creates payload:
+ *
+ *       [Time, TOA, RSSI, FP_POWER]
+ *
+ *  5. Sends the measurement through UDP.
+ *
+ *
+ * UDP implementation is intentionally left blank below.
+ *
+ * ============================================================
+ */
+
+
+/*
+ * ============================================================
+ *                    NODE IDENTIFICATION
+ * ============================================================
+ *
+ * Change ONLY NODE_ID when programming each physical board.
+ *
+ * Board 1:
+ *      #define NODE_ID NODE01
+ *
+ * Board 2:
+ *      #define NODE_ID NODE02
+ *
+ * Board 3:
+ *      #define NODE_ID NODE03
+ *
+ * ============================================================
+ */
+
+enum NodeID
+{
+    NODE01 = 1,
+    NODE02 = 2,
+    NODE03 = 3
+};
+
+
+// ============================================================
+// SELECT CURRENT NODE
+// ============================================================
+
+#define NODE_ID NODE01
+
+
+/*
+ * ============================================================
+ *                    DW1000 CONFIGURATION
+ * ============================================================
+ *
+ * The actual SPI communication required by the DW1000 is
+ * handled by the DW1000 library.
+ *
+ * No application-level SPI communication is implemented here.
+ *
+ * ============================================================
+ */
+
+#define UWB_CHANNEL 5
+
+
+/*
+ * ============================================================
+ *                    UWB PACKET
+ * ============================================================
+ *
+ * Packet transmitted by each node.
+ *
+ * The packet contains:
+ *
+ *      Sender Node ID
+ *      Packet Sequence Number
+ *      Sender Time
+ *
+ * ============================================================
+ */
+
+struct UWBPacket
+{
+    uint8_t nodeID;
+
+    uint32_t sequence;
+
+    uint64_t transmitTime;
+};
+
+
+/*
+ * ============================================================
+ *                    RSSI MEASUREMENT
+ * ============================================================
+ *
+ * Final measurement format:
+ *
+ *      [Time, TOA, RSSI, FP_POWER]
+ *
+ * ============================================================
+ */
+
+struct RSSIMeasurement
+{
+    uint8_t receiverNode;
+
+    uint8_t transmitterNode;
+
+    uint64_t globalTime;
+
+    uint64_t toa;
+
+    float rssi;
+
+    float fpPower;
+
+    uint32_t sequence;
+};
+
+
+/*
+ * ============================================================
+ *                    GLOBAL VARIABLES
+ * ============================================================
+ */
+
+volatile bool packetReceived = false;
+
+volatile bool receiveError = false;
+
+uint32_t packetSequence = 0;
+
+
+/*
+ * Buffer for incoming UWB packet.
+ */
+
+byte receivedData[128];
+
+
+/*
+ * ============================================================
+ *                 NODE NAME FUNCTION
+ * ============================================================
+ */
+
+const char* getNodeName(uint8_t nodeID)
+{
+    switch (nodeID)
+    {
+        case NODE01:
+            return "NODE01";
+
+        case NODE02:
+            return "NODE02";
+
+        case NODE03:
+            return "NODE03";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+
+/*
+ * ============================================================
+ *                 GLOBAL TIME FUNCTION
+ * ============================================================
+ *
+ * IMPORTANT:
+ *
+ * millis() is only a TEMPORARY placeholder.
+ *
+ * It is NOT a globally synchronized clock.
+ *
+ * For the final TDoA implementation, this function should
+ * return the synchronized global time.
+ *
+ * Possible future implementations:
+ *
+ *      - UWB clock synchronization
+ *      - GNSS timing
+ *      - External timing reference
+ *      - Network time synchronization
+ *
+ * ============================================================
+ */
+
+uint64_t getGlobalTime()
+{
+    /*
+     * ========================================================
+     * TODO:
+     *
+     * Implement global/synchronized time here.
+     *
+     * ========================================================
+     */
+
+    return millis();
+}
+
+
+/*
+ * ============================================================
+ *                 RECEIVE CALLBACK
+ * ============================================================
+ */
+
+void handleReceived()
+{
+    packetReceived = true;
+}
+
+
+/*
+ * ============================================================
+ *                 RECEIVE ERROR CALLBACK
+ * ============================================================
+ */
+
+void handleReceiveError()
+{
+    receiveError = true;
+}
+
+
+/*
+ * ============================================================
+ *                 START DW1000 RECEIVER
+ * ============================================================
+ */
+
+void startReceiver()
+{
+    DW1000.newReceive();
+
+    DW1000.setDefaults();
+
+    /*
+     * Continuous reception.
+     */
+
+    DW1000.receivePermanently(true);
+
+    DW1000.startReceive();
+}
+
+
+/*
+ * ============================================================
+ *                 TRANSMIT UWB PACKET
+ * ============================================================
+ */
+
+void transmitPacket()
+{
+    UWBPacket packet;
+
+
+    /*
+     * --------------------------------------------------------
+     * Identify transmitting node
+     * --------------------------------------------------------
+     */
+
+    packet.nodeID = NODE_ID;
+
+
+    /*
+     * --------------------------------------------------------
+     * Packet sequence number
+     * --------------------------------------------------------
+     */
+
+    packet.sequence = packetSequence++;
+
+
+    /*
+     * --------------------------------------------------------
+     * Sender timestamp
+     * --------------------------------------------------------
+     */
+
+    packet.transmitTime = getGlobalTime();
+
+
+    /*
+     * --------------------------------------------------------
+     * Convert structure to byte array
+     * --------------------------------------------------------
+     */
+
+    byte data[sizeof(UWBPacket)];
+
+    memcpy(
+        data,
+        &packet,
+        sizeof(UWBPacket)
+    );
+
+
+    /*
+     * --------------------------------------------------------
+     * DW1000 TRANSMISSION
+     * --------------------------------------------------------
+     */
+
+    DW1000.newTransmit();
+
+    DW1000.setDefaults();
+
+    DW1000.setData(
+        data,
+        sizeof(UWBPacket)
+    );
+
+    DW1000.startTransmit();
+}
+
+
+/*
+ * ============================================================
+ *              PROCESS RECEIVED UWB PACKET
+ * ============================================================
+ */
+
+void processReceivedPacket()
+{
+    /*
+     * --------------------------------------------------------
+     * Get received data
+     * --------------------------------------------------------
+     */
+
+    DW1000.getData(receivedData);
+
+
+    /*
+     * --------------------------------------------------------
+     * Convert received bytes into packet structure
+     * --------------------------------------------------------
+     */
+
+    UWBPacket packet;
+
+    memcpy(
+        &packet,
+        receivedData,
+        sizeof(UWBPacket)
+    );
+
+
+    /*
+     * --------------------------------------------------------
+     * Ignore packets transmitted by this node.
+     * --------------------------------------------------------
+     */
+
+    if (packet.nodeID == NODE_ID)
+    {
+        return;
+    }
+
+
+    /*
+     * --------------------------------------------------------
+     * GLOBAL TIME
+     * --------------------------------------------------------
+     */
+
+    uint64_t globalTime = getGlobalTime();
+
+
+    /*
+     * --------------------------------------------------------
+     * TIME OF ARRIVAL
+     * --------------------------------------------------------
+     */
+
+    DW1000Time receiveTimestamp;
+
+    DW1000.getReceiveTimestamp(receiveTimestamp);
+
+    uint64_t toa = receiveTimestamp.getTimestamp();
+
+
+    /*
+     * --------------------------------------------------------
+     * RSSI / RECEIVED POWER
+     * --------------------------------------------------------
+     *
+     * DW1000 receive-power estimate.
+     *
+     * Unit:
+     *
+     *      dBm
+     *
+     * --------------------------------------------------------
+     */
+
+    float rssi = DW1000.getReceivePower();
+
+
+    /*
+     * --------------------------------------------------------
+     * FIRST PATH POWER
+     * --------------------------------------------------------
+     *
+     * Unit:
+     *
+     *      dBm
+     *
+     * --------------------------------------------------------
+     */
+
+    float fpPower = DW1000.getFirstPathPower();
+
+
+    /*
+     * ========================================================
+     *              CREATE MEASUREMENT
+     * ========================================================
+     */
+
+    RSSIMeasurement measurement;
+
+
+    measurement.receiverNode =
+        NODE_ID;
+
+
+    measurement.transmitterNode =
+        packet.nodeID;
+
+
+    measurement.globalTime =
+        globalTime;
+
+
+    measurement.toa =
+        toa;
+
+
+    measurement.rssi =
+        rssi;
+
+
+    measurement.fpPower =
+        fpPower;
+
+
+    measurement.sequence =
+        packet.sequence;
+
+
+    /*
+     * ========================================================
+     *             FORMAT PAYLOAD
+     * ========================================================
+     *
+     * Required format:
+     *
+     *      [Time, TOA, RSSI, FP_POWER]
+     *
+     * Example:
+     *
+     *      [12345, 82937492837, -67.23, -69.81]
+     *
+     * ========================================================
+     */
+
+
+    /*
+     * --------------------------------------------------------
+     * TODO:
+     *
+     * Convert measurement into UDP payload.
+     *
+     * --------------------------------------------------------
+     *
+     * Example future implementation:
+     *
+     * char payload[150];
+     *
+     * snprintf(
+     *     payload,
+     *     sizeof(payload),
+     *     "[%llu, %llu, %.2f, %.2f]",
+     *     measurement.globalTime,
+     *     measurement.toa,
+     *     measurement.rssi,
+     *     measurement.fpPower
+     * );
+     *
+     * --------------------------------------------------------
+     */
+
+
+    /*
+     * ========================================================
+     *                    UDP SECTION
+     * ========================================================
+     *
+     * UDP communication will be implemented here.
+     *
+     * Each node can transmit the measurement to a central
+     * computer/server or another network node.
+     *
+     * ========================================================
+     */
+
+
+    /*
+     * --------------------------------------------------------
+     * UDP LIBRARY
+     * --------------------------------------------------------
+     *
+     * Future:
+     *
+     * #include <WiFi.h>
+     * #include <WiFiUdp.h>
+     *
+     * --------------------------------------------------------
+     */
+
+
+    /*
+     * --------------------------------------------------------
+     * WIFI CONFIGURATION
+     * --------------------------------------------------------
+     *
+     * const char* WIFI_SSID = "...";
+     * const char* WIFI_PASSWORD = "...";
+     *
+     * --------------------------------------------------------
+     */
+
+
+    /*
+     * --------------------------------------------------------
+     * UDP CONFIGURATION
+     * --------------------------------------------------------
+     *
+     * WiFiUDP udp;
+     *
+     * const char* UDP_SERVER_IP = "...";
+     *
+     * const uint16_t UDP_PORT = 5005;
+     *
+     * --------------------------------------------------------
+     */
+
+
+    /*
+     * --------------------------------------------------------
+     * UDP TRANSMISSION
+     * --------------------------------------------------------
+     *
+     * Example future implementation:
+     *
+     * udp.beginPacket(
+     *     UDP_SERVER_IP,
+     *     UDP_PORT
+     * );
+     *
+     * udp.print(payload);
+     *
+     * udp.endPacket();
+     *
+     * --------------------------------------------------------
+     */
+
+
+    /*
+     * --------------------------------------------------------
+     * OPTIONAL:
+     *
+     * Include node IDs in the UDP packet.
+     *
+     * Example:
+     *
+     * NODE02,NODE01,[12345,82937492837,-67.23,-69.81]
+     *
+     * This means:
+     *
+     * Receiver = NODE02
+     * Sender   = NODE01
+     *
+     * --------------------------------------------------------
+     */
+
+
+    /*
+     * Restart receiver after processing.
+     */
+
+    startReceiver();
+}
+
+
+/*
+ * ============================================================
+ *                         SETUP
+ * ============================================================
+ */
+
+void setup()
+{
+    /*
+     * --------------------------------------------------------
+     * NO UART / SERIAL COMMUNICATION
+     * --------------------------------------------------------
+     *
+     * Serial.begin() intentionally NOT used.
+     *
+     * --------------------------------------------------------
+     */
+
+
+    /*
+     * --------------------------------------------------------
+     * DW1000 INITIALIZATION
+     * --------------------------------------------------------
+     *
+     * The DW1000 library internally handles communication
+     * with the DW1000 hardware.
+     *
+     * --------------------------------------------------------
+     */
+
+    DW1000.begin();
+
+    DW1000.select();
+
+
+    /*
+     * --------------------------------------------------------
+     * DW1000 CONFIGURATION
+     * --------------------------------------------------------
+     */
+
+    DW1000.newConfiguration();
+
+    DW1000.setDefaults();
+
+    DW1000.setChannel(UWB_CHANNEL);
+
+    DW1000.commitConfiguration();
+
+
+    /*
+     * --------------------------------------------------------
+     * CALLBACKS
+     * --------------------------------------------------------
+     */
+
+    DW1000.attachReceivedHandler(
+        handleReceived
+    );
+
+    DW1000.attachReceiveFailedHandler(
+        handleReceiveError
+    );
+
+
+    /*
+     * --------------------------------------------------------
+     * START RECEIVER
+     * --------------------------------------------------------
+     */
+
+    startReceiver();
+
+
+    /*
+     * ========================================================
+     *                  UDP INITIALIZATION
+     * ========================================================
+     *
+     * TODO:
+     *
+     * Initialize Wi-Fi.
+     *
+     * Example:
+     *
+     * WiFi.begin(
+     *     WIFI_SSID,
+     *     WIFI_PASSWORD
+     * );
+     *
+     *
+     * Then initialize UDP:
+     *
+     * udp.begin(UDP_PORT);
+     *
+     * ========================================================
+     */
+}
+
+
+/*
+ * ============================================================
+ *                          LOOP
+ * ============================================================
+ */
+
+void loop()
+{
+    /*
+     * --------------------------------------------------------
+     * PROCESS RECEIVED UWB PACKET
+     * --------------------------------------------------------
+     */
+
+    if (packetReceived)
+    {
+        packetReceived = false;
+
+        processReceivedPacket();
+    }
+
+
+    /*
+     * --------------------------------------------------------
+     * HANDLE RECEIVE ERROR
+     * --------------------------------------------------------
+     */
+
+    if (receiveError)
+    {
+        receiveError = false;
+
+        startReceiver();
+    }
+
+
+    /*
+     * ========================================================
+     *             PERIODIC UWB TRANSMISSION
+     * ========================================================
+     *
+     * TEMPORARY TEST IMPLEMENTATION
+     *
+     * Each node transmits once every second.
+     *
+     * This should later be replaced with a synchronized
+     * transmission schedule for the final TDoA system.
+     *
+     * ========================================================
+     */
+
+    static uint32_t lastTransmission = 0;
+
+
+    if (millis() - lastTransmission >= 1000)
+    {
+        lastTransmission = millis();
+
+        transmitPacket();
+    }
+
+
+    /*
+     * ========================================================
+     *                     UDP SECTION
+     * ========================================================
+     *
+     * UDP reception/transmission code can be added here.
+     *
+     * For example:
+     *
+     *      - UDP packet handling
+     *      - Wi-Fi connection monitoring
+     *      - Measurement forwarding
+     *      - Node status messages
+     *
+     * ========================================================
+     */
+}
