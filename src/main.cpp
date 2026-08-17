@@ -11,19 +11,21 @@ const char* ssid = "Airtel_Housr 409-410";  // enter wifi or hotspot name here
 const char* password = "Housr@12345"; // enter the wifi or hotspot password here
 
 // Destination (Laptop) IP and Port for UDP data reporting
-// Pre-seeded with laptop's known IP; updated dynamically on first command
-IPAddress remoteIP(192, 168, 1, 2);  // Your laptop's IP on the shared network
-bool remoteIPKnown = true;           // Set true since IP is pre-configured
+// AUTO-DISCOVERED: learned from the first UDP command received from the dashboard.
+// No hardcoded IP needed — works on any WiFi without re-flashing.
+IPAddress remoteIP(0, 0, 0, 0);
+bool remoteIPKnown = false;
 unsigned int remotePort = 4210; 
 
-WiFiUDP udp; // UDP client for sending data
-WiFiUDP udpServer; // UDP server for receiving commands
+// Single WiFiUDP object used for BOTH receiving commands and sending payloads.
+// Using one object avoids the silent send-failure bug caused by an un-initialized client socket.
+WiFiUDP udp;
 unsigned int localCommandPort = 8888;
 
 // ============================================================
 // NODE IDENTIFICATION & STATE
 // ============================================================
-const uint8_t CUSTOM_NodeID = 2;  // Change custom node ID number here for each device
+const uint8_t CUSTOM_NodeID = 3;  // Change custom node ID number here for each device
 
 enum NodeMode {
     MODE_IDLE,
@@ -130,9 +132,9 @@ void setup() {
     Serial.print("Node MAC Address: ");
     Serial.println(esp_mac);
     
-    // Start UDP server for receiving commands
-    udpServer.begin(localCommandPort);
-    Serial.printf("Listening for UDP commands on port %d\n", localCommandPort);
+    // Start UDP socket for receiving commands AND sending data payloads
+    udp.begin(localCommandPort);
+    Serial.printf("UDP socket open on port %d (commands in, data out)\n", localCommandPort);
     
     // Initialize DW1000 UWB module via SPI
     SPI.begin(18, 19, 23, PIN_SS); // SCK, MISO, MOSI, SS
@@ -166,59 +168,63 @@ void loop() {
     // --------------------------------------------------------
     // PROCESS INCOMING DASHBOARD COMMANDS
     // --------------------------------------------------------
-    int packetSize = udpServer.parsePacket();
+    int packetSize = udp.parsePacket();
     if (packetSize) {
         char incomingPacket[255];
-        int len = udpServer.read(incomingPacket, 255);
+        int len = udp.read(incomingPacket, 255);
         if (len > 0) {
-            incomingPacket[len] = 0;
+            incomingPacket[len] = '\0';
         }
         
-        // Dynamically discover the laptop's IP from the sender of the command
-        IPAddress senderIP = udpServer.remoteIP();
-        // Only accept real unicast IPs (not 0.0.0.0 or 255.x.x.x)
+        // Auto-discover the laptop's IP from the UDP packet sender address
+        IPAddress senderIP = udp.remoteIP();
         if (senderIP[0] != 0 && senderIP[0] != 255) {
-            remoteIP = senderIP;
-            remoteIPKnown = true;
-            Serial.print("Laptop IP discovered: ");
-            Serial.println(remoteIP);
+            if (!remoteIPKnown || remoteIP != senderIP) {
+                remoteIP = senderIP;
+                remoteIPKnown = true;
+                Serial.print("[DISCOVERY] Laptop IP set to: ");
+                Serial.println(remoteIP);
+            }
         }
 
         String command = String(incomingPacket);
         command.trim();
-        Serial.println("Received Command: " + command + " from IP: " + udpServer.remoteIP().toString());
+        Serial.println("[CMD] Received: " + command + " from " + udp.remoteIP().toString());
 
-        // Send an ACK back so we can confirm two-way UDP works
+        // Always ACK every received command so dashboard can confirm two-way link
         if (remoteIPKnown) {
             String ack = "ACK:" + String(CUSTOM_NodeID) + ":" + command;
             udp.beginPacket(remoteIP, remotePort);
             udp.print(ack);
             udp.endPacket();
+            Serial.println("[ACK] Sent: " + ack);
         }
         
-        // Command format: CMD:<NodeID>:<STATE>
-        // Examples: CMD:1:RX, CMD:2:TX, CMD:3:IDLE
+        // Parse command: CMD:<NodeID>:<STATE>  e.g. CMD:1:RX, CMD:2:TX, CMD:0:PING
         String expectedPrefix = "CMD:" + String(CUSTOM_NodeID) + ":";
+        String broadcastPrefix = "CMD:0:"; // node-0 commands target all nodes
         
+        String newState = "";
         if (command.startsWith(expectedPrefix)) {
-            String newState = command.substring(expectedPrefix.length());
-            
-            if (newState == "RX") {
-                currentMode = MODE_RX;
-                startReceiver();
-                Serial.println("Mode changed to RECEIVER");
-            } 
-            else if (newState == "TX") {
-                currentMode = MODE_TX;
-                enterIdleMode(); // clear any pending operations
-                Serial.println("Mode changed to TRANSMITTER");
-            } 
-            else if (newState == "IDLE") {
-                currentMode = MODE_IDLE;
-                enterIdleMode();
-                Serial.println("Mode changed to IDLE");
-            }
+            newState = command.substring(expectedPrefix.length());
+        } else if (command.startsWith(broadcastPrefix)) {
+            newState = command.substring(broadcastPrefix.length());
         }
+
+        if (newState == "RX") {
+            currentMode = MODE_RX;
+            startReceiver();
+            Serial.println("[MODE] RECEIVER");
+        } else if (newState == "TX") {
+            currentMode = MODE_TX;
+            enterIdleMode();
+            Serial.println("[MODE] TRANSMITTER");
+        } else if (newState == "IDLE") {
+            currentMode = MODE_IDLE;
+            enterIdleMode();
+            Serial.println("[MODE] IDLE");
+        }
+        // PING: already ACK'd above, nothing more to do
     }
 
     // --------------------------------------------------------
@@ -246,22 +252,34 @@ void loop() {
                     float fpPower = DW1000.getFirstPathPower();
                     uint64_t currentTime = millis();
                     
-                    // Format Payload
+                    // Build JSON payload.
+                    // NOTE: ESP32 snprintf does NOT support %llu — cast uint64_t to unsigned long.
                     char payload[256];
-                    snprintf(payload, sizeof(payload), "[%llu, %llu, %u, \"%s\", %u, %.2f, %.2f]", 
-                             currentTime, toa, CUSTOM_NodeID, esp_mac.c_str(), packet.nodeID, rssi, fpPower);
-                    
-                    Serial.println(String("Sending UDP to ") + remoteIP.toString() + ":" + remotePort);
-                    Serial.println(String("Payload: ") + payload);
-                    
+                    snprintf(payload, sizeof(payload),
+                             "[%lu, %lu, %u, \"%s\", %u, %.2f, %.2f]",
+                             (unsigned long)currentTime,
+                             (unsigned long)toa,
+                             (unsigned int)CUSTOM_NodeID,
+                             esp_mac.c_str(),
+                             (unsigned int)packet.nodeID,
+                             rssi,
+                             fpPower);
+
+                    Serial.print("[PAYLOAD] ");
+                    Serial.println(payload);
+
                     if (remoteIPKnown) {
-                        // Transmit payload to python script via UDP
+                        Serial.print("[UDP] Sending to ");
+                        Serial.print(remoteIP);
+                        Serial.print(":");
+                        Serial.println(remotePort);
                         udp.beginPacket(remoteIP, remotePort);
                         udp.print(payload);
                         int result = udp.endPacket();
-                        Serial.println(result == 1 ? "UDP sent OK" : "UDP send FAILED");
+                        Serial.println(result == 1 ? "[UDP] Sent OK" : "[UDP] Send FAILED!");
                     } else {
-                        Serial.println("WARNING: remoteIP not yet known, cannot send UDP!");
+                        Serial.println("[UDP] WARNING: laptop IP not yet known — cannot send data!");
+                        Serial.println("      Make sure dashboard is running and sent at least one command.");
                     }
                 }
             }
